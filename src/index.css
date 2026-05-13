@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@font-face {
+    font-family: 'OkDandan';
+    src: url('https://cdn.jsdelivr.net/gh/projectnoonnu/2508-2@1.0/OkDanDan-Bold.woff2') format('woff2');
+    font-weight: normal;
+    font-style: normal;
+}
+
+@theme {
+  --font-okdandan: 'OkDandan', sans-serif;
+}
+
+body {
+  font-family: 'OkDandan', sans-serif;
+}
