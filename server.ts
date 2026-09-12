@@ -1,10 +1,8 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import cookieParser from "cookie-parser";
-import session from "express-session";
 import dotenv from "dotenv";
-import axios from "axios";
-import * as cheerio from "cheerio";
+import { addDays, formatKorean } from "./src/lib/date";
+import { splitMenuLines, classifyToTray } from "./src/lib/mealParser";
 
 dotenv.config();
 
@@ -12,63 +10,92 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json());
-app.use(cookieParser());
-app.use(session({
-  secret: 'hb2-secret',
-  resave: false,
-  saveUninitialized: true,
-  cookie: { 
-    secure: true, 
-    sameSite: 'none',
-    httpOnly: true 
+
+// --- NEIS(나이스 교육정보개방포털) 급식 정보 프록시 ---
+const NEIS_BASE = "https://open.neis.go.kr/hub";
+const OFFICE_CODE = process.env.NEIS_OFFICE_CODE || "J10"; // 경기도교육청
+const KINDER_NAME = process.env.NEIS_SCHOOL_NAME || "빛가람유치원";
+let cachedSchoolCode = process.env.NEIS_SCHOOL_CODE || "";
+
+async function resolveSchoolCode(apiKey: string): Promise<string> {
+  if (cachedSchoolCode) return cachedSchoolCode;
+
+  const url = new URL(`${NEIS_BASE}/childSchoolInfo`);
+  url.searchParams.set("KEY", apiKey);
+  url.searchParams.set("Type", "json");
+  url.searchParams.set("ATPT_OFCDC_SC_CODE", OFFICE_CODE);
+  url.searchParams.set("KINDER_NM", KINDER_NAME);
+
+  const res = await fetch(url.toString());
+  const data = await res.json();
+  const row = data?.childSchoolInfo?.[1]?.row?.[0];
+  if (!row?.SD_SCHUL_CODE) {
+    throw new Error(`유치원 정보를 찾을 수 없습니다 (${KINDER_NAME})`);
   }
-}));
+  cachedSchoolCode = row.SD_SCHUL_CODE;
+  return cachedSchoolCode;
+}
 
-// Naver Weather Proxy API
-app.get("/api/weather/naver", async (req, res) => {
+async function fetchMealForDate(apiKey: string, schoolCode: string, dateKey: string) {
+  const ymd = dateKey.replace(/-/g, "");
+  const url = new URL(`${NEIS_BASE}/mealServiceDietInfo`);
+  url.searchParams.set("KEY", apiKey);
+  url.searchParams.set("Type", "json");
+  url.searchParams.set("ATPT_OFCDC_SC_CODE", OFFICE_CODE);
+  url.searchParams.set("SD_SCHUL_CODE", schoolCode);
+  url.searchParams.set("MLSV_YMD", ymd);
+
+  const res = await fetch(url.toString());
+  const data = await res.json();
+  const rows = data?.mealServiceDietInfo?.[1]?.row;
+  if (!rows || rows.length === 0) return null;
+
+  // 중식(점심) 정보를 우선 사용, 없으면 첫 번째 행 사용
+  const lunch = rows.find((r: any) => r.MMEAL_SC_CODE === "2") || rows[0];
+  return lunch?.DDISH_NM as string | undefined;
+}
+
+app.get("/api/meal", async (req, res) => {
   try {
-    const location = (req.query.location as string) || "시흥시 장현동";
-    
-    // 1. Official Search API Call (if keys exist)
-    const clientId = process.env.NAVER_CLIENT_ID;
-    const clientSecret = process.env.NAVER_CLIENT_SECRET;
-    let searchMetadata = "";
-
-    if (clientId && clientSecret) {
-      try {
-        const searchRes = await axios.get("https://openapi.naver.com/v1/search/webkr.json", {
-          params: { query: `${location} 날씨`, display: 1 },
-          headers: {
-            'X-Naver-Client-Id': clientId,
-            'X-Naver-Client-Secret': clientSecret
-          }
-        });
-        searchMetadata = JSON.stringify(searchRes.data.items[0]);
-      } catch (e) {
-        console.warn("Naver Official Search API failed");
-      }
+    const requestedDate = (req.query.date as string) || new Date().toISOString().split("T")[0];
+    const apiKey = process.env.NEIS_API_KEY;
+    if (!apiKey) {
+      return res.status(400).json({ error: "NEIS_API_KEY가 설정되어 있지 않습니다. .env 파일을 확인해주세요." });
     }
 
-    // 2. Scraping Naver Weather (Search using the provided location)
-    const weatherUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(location + " 날씨")}`;
-    const { data: html } = await axios.get(weatherUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
+    const schoolCode = await resolveSchoolCode(apiKey);
 
-    const $ = cheerio.load(html);
-    const weatherContent = $(".content_area").text().slice(0, 3000) || $("body").text().slice(0, 3000);
+    let cursor = requestedDate;
+    let ddishNm: string | undefined;
+    let triesLeft = 10;
+    while (triesLeft > 0) {
+      ddishNm = (await fetchMealForDate(apiKey, schoolCode, cursor)) || undefined;
+      if (ddishNm) break;
+      cursor = addDays(cursor, -1);
+      triesLeft -= 1;
+    }
+
+    if (!ddishNm) {
+      return res.status(404).json({ error: "최근 급식 정보를 찾을 수 없습니다." });
+    }
+
+    const items = splitMenuLines(ddishNm);
+    const tray = classifyToTray(items);
+    const isSubstitute = cursor !== requestedDate;
 
     res.json({
-      rawText: weatherContent,
-      location: location,
-      searchMetadata,
-      timestamp: new Date().toISOString()
+      requestedDate,
+      actualDate: cursor,
+      isSubstitute,
+      note: isSubstitute
+        ? `${requestedDate}에는 급식 정보가 없어 가장 최근 평일인 ${formatKorean(cursor)} 식단으로 표시합니다.`
+        : undefined,
+      items,
+      tray,
     });
   } catch (error: any) {
-    console.error("Naver Weather Fetch Error:", error.message);
-    res.status(500).json({ error: "Failed to fetch Naver weather data" });
+    console.error("NEIS Meal Fetch Error:", error.message);
+    res.status(500).json({ error: error.message || "급식 정보를 불러오지 못했습니다." });
   }
 });
 
